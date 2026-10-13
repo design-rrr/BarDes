@@ -4,7 +4,7 @@ Project-level instructions for working in this repository.
 
 ## Git / GitHub identity
 
-- Repo owner on GitHub: **design-rrr** (`https://github.com/design-rrr/Des_Bar.git`).
+- Repo owner on GitHub: **design-rrr** (`https://github.com/design-rrr/BarDes.git`).
 - Commit authorship is pinned to **design-rrr**
   (`207247077+design-rrr@users.noreply.github.com`). Do not change
   `user.name`/`user.email` in `.git/config`.

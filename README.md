@@ -1,4 +1,4 @@
-# DesBar
+# BarDes
 
 Posts 4 links from [Sidebar.io](https://sidebar.io/) feed to the [Stacker.news](https://stacker.news) **~Design** territory every weekday, at a random time between 1am-3am UTC.
 

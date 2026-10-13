@@ -367,7 +367,7 @@ function feeConfig () {
 // itemRepetition() is authoritative only for comments (real parent id). For a ROOT post
 // the resolver does Number(parentId), and Number(null) === 0 makes item_spam(0, user) always
 // match nothing, so it ALWAYS returns 0 for new posts — the preflight stayed blind while the
-// 10x spend still applied (the DesBar/1575002 collision). For root posts we count this
+// 10x spend still applied (the BarDes/1575002 collision). For root posts we count this
 // account's own root posts (parentId === null) created within SN's ITEM_SPAM_INTERVAL ('10m'),
 // which is exactly item_spam(NULL, me.id).
 const FEE_SPAM_WINDOW_MS = 10 * 60 * 1000;
