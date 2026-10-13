@@ -665,18 +665,44 @@ async function postLink(url, title, text) {
   throw new Error(`Failed to create post: ${JSON.stringify(data)}`);
 }
 
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+function isDeadStatus(status) {
+  return status === 404 || status === 410;
+}
+
+async function probeUrl(url, method) {
+  return fetch(url, {
+    method,
+    redirect: 'follow',
+    signal: AbortSignal.timeout(10000),
+    headers: {
+      'user-agent': BROWSER_UA,
+      ...(method === 'GET' ? { range: 'bytes=0-2048' } : {}),
+    },
+  });
+}
+
 async function isLinkAlive(url) {
-  try {
-    const res = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(10000) });
-    if (!res.ok) {
-      console.log(`  Link returned ${res.status}, skipping.`);
-      return false;
+  for (const method of ['HEAD', 'GET']) {
+    try {
+      const res = await probeUrl(url, method);
+      if (isDeadStatus(res.status)) {
+        console.log(`  Link returned ${res.status}, skipping.`);
+        return false;
+      }
+      if (res.ok) return true;
+      if (method === 'GET') {
+        console.log(`  Link returned ${res.status}, proceeding anyway (likely bot-blocked, not dead).`);
+        return true;
+      }
+      console.log(`  Link returned ${res.status} on HEAD, retrying with GET...`);
+    } catch (err) {
+      console.log(`  ${method} link check failed (${err.message})`);
     }
-    return true;
-  } catch (err) {
-    console.log(`  Link check failed (${err.message}), proceeding anyway.`);
-    return true;
   }
+  console.log('  Link check failed, proceeding anyway.');
+  return true;
 }
 
 async function postItem(item, sk) {
