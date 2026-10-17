@@ -20,6 +20,10 @@ on:
 jobs:
   post:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
+    concurrency:
+      group: post-sidebar
+      cancel-in-progress: false
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -60,6 +64,7 @@ jobs:
           SN_FEE_MAX_RETRIES: '2'
           SN_FEE_RETRY_MIN: '10'
           SN_FEE_RETRY_MODE: 'sleep'
+          SN_MAX_RUNTIME_MIN: '6'
 
       - name: Save posted URLs cache
         uses: actions/cache/save@v4

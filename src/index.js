@@ -153,6 +153,23 @@ function delay(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function envMins(name, dflt) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : dflt;
+}
+
+function httpTimeoutMs() { return envMins('SN_HTTP_TIMEOUT_SEC', 20) * 1000; }
+function uploadTimeoutMs() { return envMins('SN_UPLOAD_TIMEOUT_SEC', 60) * 1000; }
+function nostrPublishTimeoutMs() { return envMins('SN_NOSTR_PUBLISH_TIMEOUT_SEC', 15) * 1000; }
+function maxRuntimeMs() { return envMins('SN_MAX_RUNTIME_MIN', 6) * 60_000; }
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    delay(ms).then(() => { throw new Error(`${label} timed out after ${Math.round(ms / 1000)}s`); }),
+  ]);
+}
+
 function getPrivateKeyBytes(nostrSecret) {
   if (nostrSecret.startsWith('nsec1')) {
     const { data } = nip19.decode(nostrSecret);
@@ -212,6 +229,7 @@ async function nostrLogin() {
       authRes = await fetch(SN_GRAPHQL, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
+        signal: AbortSignal.timeout(httpTimeoutMs()),
         body: JSON.stringify({
           query: `mutation createAuth { createAuth { k1 } }`,
         }),
@@ -255,7 +273,9 @@ async function nostrLogin() {
 
   // Try simple fetch first (works locally, often WAF-blocked from GH Actions)
   for (let attempt = 0; attempt < 3; attempt++) {
-    const csrfRes = await fetch(`${SN_BASE}/api/auth/csrf`);
+    const csrfRes = await fetch(`${SN_BASE}/api/auth/csrf`, {
+      signal: AbortSignal.timeout(httpTimeoutMs()),
+    });
     setCookies(csrfRes.headers.getSetCookie());
     csrfToken = extractCsrfFromCookies();
     if (csrfToken) break;
@@ -283,6 +303,7 @@ async function nostrLogin() {
           'content-type': 'application/x-www-form-urlencoded',
           cookie: getCookieHeader(),
         },
+        signal: AbortSignal.timeout(httpTimeoutMs()),
         body: new URLSearchParams({
           csrfToken,
           event: JSON.stringify(signedEvent),
@@ -326,6 +347,7 @@ async function fetchSidebarPosts() {
   const res = await fetch(SIDEBAR_GRAPHQL, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
+    signal: AbortSignal.timeout(httpTimeoutMs()),
     body: JSON.stringify({
       query: `query { posts { results { _id title url body categories { name } } } }`,
     }),
@@ -425,6 +447,7 @@ async function snApiCall(query, variables, { allowReauth = true } = {}) {
       'content-type': 'application/json',
       cookie: getCookieHeader(),
     },
+    signal: AbortSignal.timeout(httpTimeoutMs()),
     body: JSON.stringify({ query, variables }),
   });
 
@@ -450,27 +473,88 @@ async function snApiCall(query, variables, { allowReauth = true } = {}) {
 }
 
 async function fetchRecentDesignUrls() {
-  const urls = new Set();
-  try {
-    const data = await snApiCall(`
-      {
-        items(sub: "${SUB_NAME}", sort: "recent", limit: 100) {
-          items { url }
-        }
+  const data = await snApiCall(`
+    {
+      items(sub: "${SUB_NAME}", sort: "new", limit: 100) {
+        items { url }
       }
-    `);
-    const items = data.items?.items || [];
-    for (const item of items) {
-      if (item.url) urls.add(normalizeUrl(item.url));
     }
-  } catch (err) {
-    console.log(`  Failed to fetch Design items: ${err.message}`);
+  `);
+  const items = data.items?.items || [];
+  const urls = new Set();
+  for (const item of items) {
+    if (item.url) urls.add(normalizeUrl(item.url));
+  }
+  if (urls.size === 0) {
+    throw new Error(`empty ~${SUB_NAME} listing (${items.length} items returned)`);
   }
   return urls;
 }
 
+async function fetchMyPostedUrls() {
+  const me = await snApiCall('query Me { me { name } }');
+  const name = me?.me?.name;
+  if (!name) throw new Error('could not resolve SN username');
+  const data = await snApiCall(
+    'query MyItems($name: String!) { items(name: $name, sort: "user", limit: 100) { items { url } } }',
+    { name }
+  );
+  const urls = new Set();
+  for (const item of data.items?.items || []) {
+    if (item.url) urls.add(normalizeUrl(item.url));
+  }
+  if (urls.size === 0) {
+    throw new Error(`no link posts returned for @${name}`);
+  }
+  return urls;
+}
+
+async function loadDupeSources() {
+  const sources = [
+    [`~${SUB_NAME} newest items`, fetchRecentDesignUrls],
+    ['own posted items', fetchMyPostedUrls],
+  ];
+  const loaded = [];
+  for (const [label, fetcher] of sources) {
+    try {
+      const urls = await fetcher();
+      loaded.push(urls);
+      console.log(`  ${label}: ${urls.size} URL(s)`);
+    } catch (err) {
+      console.log(`  ${label} unavailable: ${err.message}`);
+    }
+  }
+  if (loaded.length === 0) {
+    throw new Error('no dupe source reachable on SN, refusing to post');
+  }
+  let added = 0;
+  for (const urls of loaded) {
+    for (const url of urls) {
+      if (!postedUrls.has(url)) {
+        postedUrls.add(url);
+        added += 1;
+      }
+    }
+  }
+  return added;
+}
+
+function snDupesMightMiss(url) {
+  try {
+    const labels = new URL(normalizeUrl(url)).hostname.split('.');
+    if (labels.length < 3) return false;
+    const subdomain = labels.slice(0, -2);
+    return subdomain.length !== 1 || !/^\w+$/.test(subdomain[0]);
+  } catch {
+    return false;
+  }
+}
+
 async function isAlreadyPosted(url, extraVariants = []) {
   const normalUrl = normalizeUrl(url);
+  if (snDupesMightMiss(normalUrl)) {
+    console.log(`    → SN's dupe query is unreliable for this host (hyphenated/multi-label subdomain), trusting local checks instead`);
+  }
   const variants = new Set([normalUrl, url, ...extraVariants].filter(Boolean));
   let anySucceeded = false;
   for (const variant of variants) {
@@ -526,7 +610,11 @@ async function uploadToS3(signedPost, imageBuffer, type) {
   formData.append('acl', 'public-read');
   formData.append('file', new Blob([imageBuffer], { type }), 'screenshot.png');
 
-  const res = await fetch(url, { method: 'POST', body: formData });
+  const res = await fetch(url, {
+    method: 'POST',
+    body: formData,
+    signal: AbortSignal.timeout(uploadTimeoutMs()),
+  });
   if (!res.ok) {
     throw new Error(`S3 upload failed: ${res.status} ${await res.text()}`);
   }
@@ -563,6 +651,7 @@ async function uploadToBlossom(buffer, mimeType, sk) {
 
   const res = await fetch(`${BLOSSOM_SERVER}/upload`, {
     method: 'PUT',
+    signal: AbortSignal.timeout(uploadTimeoutMs()),
     headers: {
       'Authorization': `Nostr ${base64url(event)}`,
       'Content-Type': mimeType,
@@ -591,8 +680,11 @@ async function publishNostrNote(content, sk) {
 
   const pool = new SimplePool();
   const pubs = pool.publish(NOSTR_RELAYS, event);
-  await Promise.allSettled(pubs);
-  pool.close(NOSTR_RELAYS);
+  try {
+    await withTimeout(Promise.allSettled(pubs), nostrPublishTimeoutMs(), 'Nostr publish');
+  } finally {
+    pool.close(NOSTR_RELAYS);
+  }
 
   console.log(`  Published Nostr note: ${event.id}`);
   return event.id;
@@ -613,12 +705,14 @@ async function postToTwitter(text, imageBuffer) {
   const client = new TwitterApi(TWITTER_CREDENTIALS);
   let mediaId;
   if (imageBuffer) {
-    mediaId = await client.v1.uploadMedia(imageBuffer, { mimeType: 'image/png' });
+    mediaId = await withTimeout(
+      client.v1.uploadMedia(imageBuffer, { mimeType: 'image/png' }),
+      uploadTimeoutMs(), 'Twitter media upload');
   }
-  await client.v2.tweet({
+  await withTimeout(client.v2.tweet({
     text: text.slice(0, 4000),
     media: mediaId ? { media_ids: [mediaId] } : undefined,
-  });
+  }), httpTimeoutMs(), 'Twitter post');
   console.log('  Posted to Twitter/X');
 }
 
@@ -861,6 +955,12 @@ async function tryPostOne(posts, sk) {
 async function main() {
   loadEnv();
 
+  const watchdog = setTimeout(() => {
+    console.error(`Watchdog: exceeded ${Math.round(maxRuntimeMs() / 60_000)} min runtime, forcing exit.`);
+    process.exit(1);
+  }, maxRuntimeMs());
+  watchdog.unref();
+
   const isDryRun = process.env.DRY_RUN === 'true';
 
   console.log('Fetching sidebar.io posts...');
@@ -891,16 +991,10 @@ async function main() {
     await nostrLogin();
   });
 
-  console.log('Fetching recent Design posts from Stacker News...');
-  const snUrls = await fetchRecentDesignUrls();
-  console.log(`Found ${snUrls.size} existing URL(s) on SN.`);
-  for (const url of snUrls) {
-    if (!postedUrls.has(url)) {
-      postedUrls.add(url);
-    }
-  }
+  console.log('Fetching dupe sources from Stacker News...');
+  const added = await loadDupeSources();
   savePostedUrlCache(null);
-  console.log(`Cache now has ${postedUrls.size} URL(s).`);
+  console.log(`Added ${added} URL(s) from SN; cache now has ${postedUrls.size}.`);
 
   if (posts.length > 0) {
     if (await tryPostOne(posts, sk)) return;
@@ -909,7 +1003,18 @@ async function main() {
   console.log('\nNo unposted items found. Nothing to do.');
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+function exitAfterFlush(code) {
+  let pending = 2;
+  const done = () => {
+    if (--pending === 0) process.exit(code);
+  };
+  process.stdout.write('', done);
+  process.stderr.write('', done);
+}
+
+main()
+  .then(() => exitAfterFlush(0))
+  .catch(err => {
+    console.error('Fatal error:', err);
+    exitAfterFlush(1);
+  });
